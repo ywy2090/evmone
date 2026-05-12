@@ -122,7 +122,7 @@ struct bytes32 : evmc_bytes32
 
 /// The alias for evmc::bytes32 to represent a big-endian 256-bit integer.
 using uint256be = bytes32;
-using hash_fn = bytes32 (*)(evmc_host_context* context, const uint8_t* data, size_t size) noexcept;
+using hash_fn = bytes32 (*)(evmc_host_context* context, const uint8_t* data, size_t size);
 
 
 /// Loads 64 bits / 8 bytes of data from the given @p data array in big-endian order.
