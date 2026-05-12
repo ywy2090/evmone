@@ -824,9 +824,11 @@ inline hash_fn get_hash_fn(evmc_host_context* context) noexcept
     if (auto* wrapped = unwrap(context); wrapped != nullptr)
         return wrapped->hash;
     // Fallback: read hash_fn directly from the extended evmc_host_context struct
-    // (used by FISCO-BCOS SM3 national crypto support)
+    // (used by FISCO-BCOS SM3 national crypto support).
+    // evmc_bytes32 and evmc::bytes32 are ABI-compatible (bytes32 : evmc_bytes32 with no
+    // extra members), so reinterpret_cast between their function pointer types is safe.
     if (context != nullptr)
-        return context->hash_fn;
+        return reinterpret_cast<hash_fn>(context->hash_fn);
     return nullptr;
 }
 
