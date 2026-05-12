@@ -376,7 +376,15 @@ inline Result keccak256(StackTop stack, int64_t gas_left, ExecutionState& state)
         return {EVMC_OUT_OF_GAS, gas_left};
 
     auto data = s != 0 ? &state.memory[i] : nullptr;
-    size = intx::be::load<uint256>(ethash::keccak256(data, s));
+    if (const auto hash_fn = state.host.get_hash_fn(); hash_fn != nullptr)
+    {
+        size = intx::be::load<uint256>(state.host.hash(data, s));
+    }
+    else
+    {
+        size = intx::be::load<uint256>(ethash::keccak256(data, s));
+    }
+
     return {EVMC_SUCCESS, gas_left};
 }
 

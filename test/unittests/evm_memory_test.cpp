@@ -97,6 +97,26 @@ TEST_P(evm, keccak256_memory_cost)
     EXPECT_EQ(result.status_code, EVMC_OUT_OF_GAS);
 }
 
+TEST_P(evm, keccak256_uses_host_custom_hash_when_available)
+{
+    static constexpr auto expected_hash =
+        0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20_bytes32;
+
+    bytes hashed_input;
+    host.hash_fn = [&hashed_input](bytes_view data) noexcept {
+        hashed_input.assign(data.begin(), data.end());
+        return expected_hash;
+    };
+
+    const auto input_word =
+        0x11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff_bytes32;
+    execute(mstore(0, input_word) + keccak256(0, 32) + ret_top());
+
+    EXPECT_STATUS(EVMC_SUCCESS);
+    EXPECT_EQ(output, bytes_view{expected_hash});
+    EXPECT_EQ(hashed_input, bytes_view{input_word});
+}
+
 TEST_P(evm, calldatacopy_memory_cost)
 {
     const auto code = calldatacopy(0, 0, 1);

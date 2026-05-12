@@ -18,14 +18,18 @@ function(add_standalone_library TARGET)
     if(CMAKE_AR)
         # Generate ar linker script.
         set(script_file ${name}.mri)
+        set(standalone_lib $<TARGET_FILE:${name}>)
         set(script "CREATE $<TARGET_FILE:${name}>\n")
         string(APPEND script "ADDLIB $<TARGET_FILE:${TARGET}>\n")
+
+        list(APPEND combine_lib "$<TARGET_FILE:${TARGET}>")
 
         get_target_property(link_libraries ${TARGET} LINK_LIBRARIES)
         foreach(lib ${link_libraries})
             get_target_property(type ${lib} TYPE)
             if(NOT type STREQUAL INTERFACE_LIBRARY)
                 string(APPEND script "ADDLIB $<TARGET_FILE:${lib}>\n")
+                list(APPEND combine_lib "$<TARGET_FILE:${lib}>")
             endif()
         endforeach()
 
@@ -33,9 +37,19 @@ function(add_standalone_library TARGET)
         file(GENERATE OUTPUT ${script_file} CONTENT ${script})
 
         # Add -standalone static library.
-        add_library(${name} STATIC)
-        target_sources(${name} PRIVATE ${script_file})
-        add_custom_command(TARGET ${name} POST_BUILD COMMAND ${CMAKE_AR} -M < ${script_file})
+        if(APPLE)
+            file(GENERATE OUTPUT tmp.cpp CONTENT "")
+            add_library(${name} STATIC tmp.cpp)
+            add_custom_command(
+                TARGET ${name}
+                POST_BUILD
+                COMMAND libtool -static -o ${standalone_lib} ${combine_lib}
+            )
+        else()
+            add_library(${name} STATIC)
+            target_sources(${name} PRIVATE ${script_file})
+            add_custom_command(TARGET ${name} POST_BUILD COMMAND ${CMAKE_AR} -M < ${script_file})
+        endif()
         add_dependencies(${name} ${TARGET})
 
         get_property(enabled_languages GLOBAL PROPERTY ENABLED_LANGUAGES)

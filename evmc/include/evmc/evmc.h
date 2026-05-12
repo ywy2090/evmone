@@ -200,6 +200,18 @@ struct evmc_message
      * The length of the code to be executed.
      */
     size_t code_size;
+
+    /**
+     * The destination address bytes (for WASM/extended call use).
+     */
+    const uint8_t* destination_ptr;
+    size_t destination_len;
+
+    /**
+     * The sender address bytes (for WASM/extended call use).
+     */
+    const uint8_t* sender_ptr;
+    size_t sender_len;
 };
 
 /** The hashed initcode used for TXCREATE instruction. */
@@ -233,8 +245,21 @@ struct evmc_tx_context
  * @struct evmc_host_context
  * The opaque data type representing the Host execution context.
  * @see evmc_execute_fn().
+ *
+ * Extended for FISCO-BCOS: includes hash_fn, isSMCrypto, version, metrics fields
+ * that enable SM3 national cryptography support and WASM integration.
  */
-struct evmc_host_context;
+struct wasm_host_interface;
+struct evmc_gas_metrics;
+struct evmc_host_context
+{
+    const struct evmc_host_interface* interface;
+    const struct wasm_host_interface* wasm_interface;
+    evmc_bytes32 (*hash_fn)(struct evmc_host_context* context, const uint8_t* data, size_t size);
+    bool isSMCrypto;
+    uint32_t version;
+    const struct evmc_gas_metrics* metrics;
+};
 
 /**
  * Get transaction context callback function.

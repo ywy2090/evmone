@@ -263,7 +263,7 @@ TARGET_OP_UNDEFINED:
 }  // namespace
 
 evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* ctx,
-    evmc_revision rev, const evmc_message& msg, const CodeAnalysis& analysis) noexcept
+    evmc_revision rev, const evmc_message& msg, const CodeAnalysis& analysis) 
 {
     const auto code = analysis.executable_code();
     const auto code_begin = code.data();
@@ -306,7 +306,7 @@ evmc_result execute(VM& vm, const evmc_host_interface& host, evmc_host_context* 
 }
 
 evmc_result execute(evmc_vm* c_vm, const evmc_host_interface* host, evmc_host_context* ctx,
-    evmc_revision rev, const evmc_message* msg, const uint8_t* code, size_t code_size) noexcept
+    evmc_revision rev, const evmc_message* msg, const uint8_t* code, size_t code_size)
 {
     auto vm = static_cast<VM*>(c_vm);
     const bytes_view container{code, code_size};

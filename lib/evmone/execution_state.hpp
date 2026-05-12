@@ -174,7 +174,10 @@ public:
         const evmc_host_interface& host_interface, evmc_host_context* host_ctx,
         bytes_view _code) noexcept
       : msg{&message}, host{host_interface, host_ctx}, rev{revision}, original_code{_code}
-    {}
+    {
+        host.set_hash_fn(
+            evmc::internal::get_hash_fn(host_ctx), evmc::internal::get_host_hash_context(host_ctx));
+    }
 
     /// Resets the contents of the ExecutionState so that it could be reused.
     void reset(const evmc_message& message, evmc_revision revision,
@@ -185,6 +188,8 @@ public:
         memory.clear();
         msg = &message;
         host = {host_interface, host_ctx};
+        host.set_hash_fn(
+            evmc::internal::get_hash_fn(host_ctx), evmc::internal::get_host_hash_context(host_ctx));
         rev = revision;
         return_data.clear();
         original_code = _code;

@@ -190,4 +190,8 @@ install(TARGETS ${install_targets} EXPORT evmoneTargets
 install(DIRECTORY ${include_dir}/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/lib/evmone/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/evmone
+    FILES_MATCHING PATTERN "*.hpp")
+
 cable_add_archive_package()

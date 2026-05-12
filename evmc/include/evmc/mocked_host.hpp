@@ -6,6 +6,7 @@
 #include <evmc/evmc.hpp>
 #include <algorithm>
 #include <cassert>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -106,6 +107,9 @@ public:
     /// The call result to be returned by the call() method.
     evmc_result call_result = {};
 
+    /// Optional custom hash implementation used by embedders extending KECCAK256 behavior.
+    std::function<bytes32(bytes_view)> hash_fn;
+
     /// The record of all block numbers for which get_block_hash() was called.
     mutable std::vector<int64_t> recorded_blockhashes;
 
@@ -146,6 +150,18 @@ private:
     }
 
 public:
+    [[nodiscard]] evmc::hash_fn get_hash_fn() const noexcept override
+    {
+        if (!hash_fn)
+            return nullptr;
+
+        return +[](evmc_host_context* context, const uint8_t* data, size_t size) noexcept
+                   -> bytes32 {
+            auto* host = Host::from_context<MockedHost>(context);
+            return host->hash_fn(bytes_view{data, size});
+        };
+    }
+
     /// Returns true if an account exists (EVMC Host method).
     bool account_exists(const address& addr) const noexcept override
     {

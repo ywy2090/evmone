@@ -8,7 +8,7 @@
 
 namespace evmone::advanced
 {
-evmc_result execute(AdvancedExecutionState& state, const AdvancedCodeAnalysis& analysis) noexcept
+evmc_result execute(AdvancedExecutionState& state, const AdvancedCodeAnalysis& analysis) 
 {
     state.analysis.advanced = &analysis;  // Allow accessing the analysis by instructions.
 
@@ -26,7 +26,7 @@ evmc_result execute(AdvancedExecutionState& state, const AdvancedCodeAnalysis& a
 }
 
 evmc_result execute(evmc_vm* /*unused*/, const evmc_host_interface* host, evmc_host_context* ctx,
-    evmc_revision rev, const evmc_message* msg, const uint8_t* code, size_t code_size) noexcept
+    evmc_revision rev, const evmc_message* msg, const uint8_t* code, size_t code_size)
 {
     const bytes_view container{code, code_size};
     const auto analysis = analyze(rev, container);
