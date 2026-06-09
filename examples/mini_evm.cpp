@@ -1,0 +1,1088 @@
+// mini_evm.cpp — 参考 evmone Baseline 的精简 EVM 实现
+//
+// 设计目标: 用最少代码展示 EVM 核心原理，便于学习 evmone 架构
+// 简化: uint256 → uint64_t, 无 EVMC, 无 EIP, 无预编译
+//
+// 编译: g++ -std=c++20 -O2 -o mini_evm mini_evm.cpp
+// 运行: ./mini_evm
+
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  类型与常量
+// ═══════════════════════════════════════════════════════════════════════════
+
+using u64 = uint64_t;
+using u8 = uint8_t;
+using bytes = std::vector<u8>;
+
+static constexpr size_t STACK_LIMIT = 1024;
+static constexpr size_t MAX_CODE_SIZE = 0x6000;
+static constexpr size_t CALL_DEPTH_LIMIT = 1024;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  操作码枚举 — 参考 instructions_opcodes.hpp
+// ═══════════════════════════════════════════════════════════════════════════
+
+enum Opcode : u8 {
+    OP_STOP = 0x00,
+    OP_ADD = 0x01,
+    OP_MUL = 0x02,
+    OP_SUB = 0x03,
+    OP_DIV = 0x04,
+    OP_MOD = 0x06,
+    OP_ADDMOD = 0x08,
+    OP_LT = 0x10,
+    OP_GT = 0x11,
+    OP_EQ = 0x14,
+    OP_ISZERO = 0x15,
+    OP_AND = 0x16,
+    OP_OR = 0x17,
+    OP_XOR = 0x18,
+    OP_NOT = 0x19,
+    OP_KECCAK256 = 0x20,
+    OP_ADDRESS = 0x30,
+    OP_CALLER = 0x33,
+    OP_CALLVALUE = 0x34,
+    OP_CALLDATALOAD = 0x35,
+    OP_CALLDATASIZE = 0x36,
+    OP_CALLDATACOPY = 0x37,
+    OP_COINBASE = 0x41,
+    OP_TIMESTAMP = 0x42,
+    OP_NUMBER = 0x43,
+    OP_POP = 0x50,
+    OP_MLOAD = 0x51,
+    OP_MSTORE = 0x52,
+    OP_MSTORE8 = 0x53,
+    OP_SLOAD = 0x54,
+    OP_SSTORE = 0x55,
+    OP_JUMP = 0x56,
+    OP_JUMPI = 0x57,
+    OP_PC = 0x58,
+    OP_GAS = 0x5a,
+    OP_JUMPDEST = 0x5b,
+    OP_PUSH1 = 0x60,
+    OP_PUSH2 = 0x61,
+    OP_PUSH3 = 0x62,
+    OP_PUSH4 = 0x63,
+    OP_PUSH5 = 0x64,
+    OP_PUSH6 = 0x65,
+    OP_PUSH7 = 0x66,
+    OP_PUSH8 = 0x67,
+    OP_DUP1 = 0x80,
+    OP_DUP2 = 0x81,
+    OP_DUP3 = 0x82,
+    OP_DUP4 = 0x83,
+    OP_SWAP1 = 0x90,
+    OP_SWAP2 = 0x91,
+    OP_SWAP3 = 0x92,
+    OP_LOG0 = 0xa0,
+    OP_CREATE = 0xf0,
+    OP_CALL = 0xf1,
+    OP_RETURN = 0xf3,
+    OP_REVERT = 0xfd,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Gas 成本表 — 参考 instructions_traits.hpp
+// ═══════════════════════════════════════════════════════════════════════════
+
+static constexpr int GAS_QUICK = 2;      // ADD, SUB, LT, GT, EQ, AND, OR, XOR, NOT
+static constexpr int GAS_MID = 3;        // MUL, DIV, MOD, PUSH, DUP, SWAP, POP
+static constexpr int GAS_SHA3 = 30;      // KECCAK256 base
+static constexpr int GAS_SHA3_WORD = 6;  // KECCAK256 per word
+static constexpr int GAS_MEMORY = 3;     // MLOAD, MSTORE
+static constexpr int GAS_SLOAD = 200;    // SLOAD (Simplified)
+static constexpr int GAS_SSTORE = 5000;  // SSTORE (Simplified, 不区分状态)
+static constexpr int GAS_JUMPDEST = 1;
+static constexpr int GAS_CALL = 700;
+static constexpr int GAS_CALL_VALUE = 9000;
+static constexpr int GAS_CREATE = 32000;
+static constexpr int GAS_LOG0 = 375;
+static constexpr int GAS_LOG_DATA = 8;
+static constexpr int GAS_CALL_STIPEND = 2300;
+static constexpr int GAS_ZERO = 0;  // STOP, REVERT, RETURN, ADDRESS, CALLER...
+
+// 简化的 gas 成本表 (256 个槽位, -1 = 未定义)
+static consteval std::array<int, 256> make_gas_table()
+{
+    std::array<int, 256> t{};
+    t.fill(-1);
+    t[OP_STOP] = GAS_ZERO;
+    t[OP_ADD] = GAS_QUICK;
+    t[OP_MUL] = GAS_MID;
+    t[OP_SUB] = GAS_QUICK;
+    t[OP_DIV] = GAS_MID;
+    t[OP_MOD] = GAS_MID;
+    t[OP_ADDMOD] = GAS_MID;
+    t[OP_LT] = GAS_QUICK;
+    t[OP_GT] = GAS_QUICK;
+    t[OP_EQ] = GAS_QUICK;
+    t[OP_ISZERO] = GAS_QUICK;
+    t[OP_AND] = GAS_QUICK;
+    t[OP_OR] = GAS_QUICK;
+    t[OP_XOR] = GAS_QUICK;
+    t[OP_NOT] = GAS_QUICK;
+    t[OP_KECCAK256] = GAS_SHA3;
+    t[OP_ADDRESS] = GAS_ZERO;
+    t[OP_CALLER] = GAS_ZERO;
+    t[OP_CALLVALUE] = GAS_ZERO;
+    t[OP_CALLDATALOAD] = GAS_QUICK;
+    t[OP_CALLDATASIZE] = GAS_QUICK;
+    t[OP_CALLDATACOPY] = GAS_QUICK;
+    t[OP_COINBASE] = GAS_ZERO;
+    t[OP_TIMESTAMP] = GAS_ZERO;
+    t[OP_NUMBER] = GAS_ZERO;
+    t[OP_POP] = GAS_QUICK;
+    t[OP_MLOAD] = GAS_MEMORY;
+    t[OP_MSTORE] = GAS_MEMORY;
+    t[OP_MSTORE8] = GAS_MEMORY;
+    t[OP_SLOAD] = GAS_SLOAD;
+    t[OP_SSTORE] = GAS_SSTORE;
+    t[OP_JUMP] = GAS_MID;
+    t[OP_JUMPI] = GAS_MID;
+    t[OP_PC] = GAS_ZERO;
+    t[OP_GAS] = GAS_ZERO;
+    t[OP_JUMPDEST] = GAS_JUMPDEST;
+    for (int op = OP_PUSH1; op <= OP_PUSH8; ++op)
+        t[op] = GAS_MID;
+    for (int op = OP_DUP1; op <= OP_DUP4; ++op)
+        t[op] = GAS_MID;
+    for (int op = OP_SWAP1; op <= OP_SWAP3; ++op)
+        t[op] = GAS_MID;
+    t[OP_LOG0] = GAS_LOG0;
+    t[OP_CREATE] = GAS_CREATE;
+    t[OP_CALL] = GAS_CALL;
+    t[OP_RETURN] = GAS_ZERO;
+    t[OP_REVERT] = GAS_ZERO;
+    return t;
+}
+
+static constexpr auto GAS_TABLE = make_gas_table();
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Stack — 参考 StackSpace + StackTop
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct Stack {
+    u64 data[STACK_LIMIT];
+    size_t size = 0;
+
+    void push(u64 v) { data[size++] = v; }
+    u64 pop() { return data[--size]; }
+    u64& top() { return data[size - 1]; }
+    u64& operator[](int i) { return data[size - 1 - i]; }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Memory — 参考 execution_state.hpp Memory 类
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct Memory {
+    bytes data;
+    size_t active_size = 0;  // EVM 认为的大小
+
+    Memory() { data.resize(4096, 0); }  // 初始 4KB
+
+    // 扩展内存 (参考 Memory::grow)
+    bool expand(size_t new_size)
+    {
+        if (new_size <= active_size)
+            return true;
+        // 对齐到 32 字节
+        new_size = (new_size + 31) & ~size_t{31};
+        if (new_size > data.size())
+            data.resize(new_size * 2, 0);  // 倍增
+        active_size = new_size;
+        return true;
+    }
+
+    // 计算内存扩展 gas (参考 grow_memory)
+    // 简化版: 只返回需要的 words 数
+    size_t words() const { return (active_size + 31) / 32; }
+
+    u64 load_u64(size_t offset)
+    {
+        if (offset + 32 > data.size())
+            return 0;
+        // 读取最后 8 字节 (big-endian 256-bit: 前 24 字节为高位)
+        u64 v = 0;
+        for (int i = 0; i < 8; ++i)
+            v = (v << 8) | data[offset + 24 + i];
+        return v;
+    }
+
+    void store_u64(size_t offset, u64 v)
+    {
+        expand(offset + 32);
+        // 清零整个 32 字节
+        std::fill_n(data.data() + offset, 32, 0);
+        // 将值存储到最后 8 字节 (big-endian 256-bit)
+        for (int i = 7; i >= 0; --i)
+        {
+            data[offset + 24 + i] = static_cast<u8>(v);
+            v >>= 8;
+        }
+    }
+
+    void store8(size_t offset, u8 v)
+    {
+        expand(offset + 1);
+        data[offset] = v;
+    }
+
+    // 读取 calldata 到 memory
+    void store_bytes(size_t offset, const u8* src, size_t len)
+    {
+        expand(offset + len);
+        std::memcpy(data.data() + offset, src, len);
+    }
+
+    const u8* ptr(size_t offset) const { return data.data() + offset; }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Host — 简化的宿主接口
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct Host {
+    std::unordered_map<u64, u64> storage;
+    u64 balance = 1000000;  // 默认余额
+
+    // 区块信息 (简化)
+    u64 coinbase = 0x1234;
+    u64 timestamp = 1700000000;
+    u64 block_number = 19000000;
+
+    u64 get_storage(u64 key) const
+    {
+        auto it = storage.find(key);
+        return it != storage.end() ? it->second : 0;
+    }
+
+    void set_storage(u64 key, u64 value) { storage[key] = value; }
+
+    // 创建检查点用于回滚 (简化: 保存整个 storage)
+    using Checkpoint = std::unordered_map<u64, u64>;
+    Checkpoint checkpoint() const { return storage; }
+    void rollback(const Checkpoint& cp) { storage = cp; }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Message — 参考 evmc_message
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct Message {
+    u64 sender = 0;
+    u64 value = 0;
+    bytes input;
+    int depth = 0;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  执行状态 — 参考 ExecutionState
+// ═══════════════════════════════════════════════════════════════════════════
+
+enum Status : int { SUCCESS = 0, REVERT = 1, FAILURE = 2 };
+
+struct ExecutionState {
+    Stack stack;
+    Memory memory;
+    Host* host;
+    Message msg;
+    u64 gas;
+    size_t pc = 0;
+    Status status = SUCCESS;
+    bytes output;
+    u64 gas_refund = 0;
+
+    // 合约地址 (简化)
+    u64 address = 0;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CodeAnalysis — 参见 baseline_analysis.cpp
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct CodeAnalysis {
+    bytes code;                // 填充后的代码
+    std::vector<bool> jumpdest;  // JUMPDEST 标记 (替代 evmone 的 BitsetSpan)
+};
+
+// 参考 analyze_jumpdests() + analyze_legacy()
+CodeAnalysis analyze(const u8* raw_code, size_t raw_size)
+{
+    if (raw_size > MAX_CODE_SIZE)
+        return {{}, {}};
+
+    CodeAnalysis result;
+
+    // 填充: +33 字节 (32 for PUSH32 + 1 STOP) — 参考 baseline_analysis.cpp
+    result.code.resize(raw_size + 33, 0);
+    std::memcpy(result.code.data(), raw_code, raw_size);
+    result.code[raw_size] = 0x00;  // STOP 终止保证
+
+    // JUMPDEST 扫描 — 参考 analyze_jumpdests()
+    result.jumpdest.resize(raw_size, false);
+    for (size_t i = 0; i < raw_size; ++i)
+    {
+        const auto op = result.code[i];
+        if (op >= OP_PUSH1 && op <= OP_PUSH8)
+            i += op - OP_PUSH1 + 1;  // 跳过立即数
+        else if (op == OP_JUMPDEST)
+            result.jumpdest[i] = true;
+    }
+
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  简化的 KECCAK256 — 教学用，非真实实现
+// ═══════════════════════════════════════════════════════════════════════════
+
+u64 simple_keccak256(const u8* data, size_t size)
+{
+    // 简化的哈希 (不是真正的 Keccak256, 仅用于教学)
+    u64 hash = 0xcbf29ce484222325;
+    for (size_t i = 0; i < size; ++i)
+    {
+        hash ^= data[i];
+        hash *= 0x100000001b3;
+    }
+    return hash;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  execute() — 参考 baseline_execution.cpp dispatch<false>
+// ═══════════════════════════════════════════════════════════════════════════
+
+Status execute(ExecutionState& state, const CodeAnalysis& analysis)
+{
+    const auto& code = analysis.code;
+    const auto& jumpdest = analysis.jumpdest;
+    auto& stack = state.stack;
+    auto& memory = state.memory;
+    auto& gas = state.gas;
+    auto& pc = state.pc;
+
+    // 主循环 — 参考 dispatch() 的 while(true)
+    // 由 padded_code 末尾的 STOP 保证终止
+    while (true)
+    {
+        const auto op = code[pc];
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Gas 检查 — 参考 check_requirements<Op>()
+        // ═══════════════════════════════════════════════════════════════
+        const int gas_cost = GAS_TABLE[op];
+        if (gas_cost < 0)
+        {
+            state.status = FAILURE;
+            return FAILURE;
+        }
+        if (gas < static_cast<u64>(gas_cost))
+        {
+            state.status = FAILURE;
+            return FAILURE;
+        }
+        gas -= gas_cost;
+
+        // ═══════════════════════════════════════════════════════════════
+        //  指令分发 — 参考 MAP_OPCODES switch 展开
+        // ═══════════════════════════════════════════════════════════════
+        switch (op)
+        {
+        // ── 算术 ─────────────────────────────────────────────────────
+        case OP_ADD:
+            stack.top() += stack.pop();
+            ++pc;
+            break;
+
+        case OP_MUL:
+            stack.top() *= stack.pop();
+            ++pc;
+            break;
+
+        case OP_SUB:
+            stack[1] = stack[1] - stack[0];
+            stack.pop();
+            ++pc;
+            break;
+
+        case OP_DIV:
+        {
+            auto& v = stack[1];
+            v = (v != 0) ? stack[0] / v : 0;
+            stack.pop();
+            ++pc;
+            break;
+        }
+
+        case OP_MOD:
+        {
+            auto& v = stack[1];
+            v = (v != 0) ? stack[0] % v : 0;
+            stack.pop();
+            ++pc;
+            break;
+        }
+
+        case OP_ADDMOD:
+        {
+            auto a = stack.pop();
+            auto b = stack.pop();
+            auto& m = stack.top();
+            m = (m != 0) ? (a + b) % m : 0;
+            ++pc;
+            break;
+        }
+
+        // ── 比较 ─────────────────────────────────────────────────────
+        case OP_LT:
+            stack[1] = (stack[0] < stack[1]) ? 1 : 0;
+            stack.pop();
+            ++pc;
+            break;
+
+        case OP_GT:
+            stack[1] = (stack[1] < stack[0]) ? 1 : 0;
+            stack.pop();
+            ++pc;
+            break;
+
+        case OP_EQ:
+            stack[1] = (stack[0] == stack[1]) ? 1 : 0;
+            stack.pop();
+            ++pc;
+            break;
+
+        case OP_ISZERO:
+            stack.top() = (stack.top() == 0) ? 1 : 0;
+            ++pc;
+            break;
+
+        // ── 位运算 ───────────────────────────────────────────────────
+        case OP_AND:
+            stack.top() &= stack.pop();
+            ++pc;
+            break;
+
+        case OP_OR:
+            stack.top() |= stack.pop();
+            ++pc;
+            break;
+
+        case OP_XOR:
+            stack.top() ^= stack.pop();
+            ++pc;
+            break;
+
+        case OP_NOT:
+            stack.top() = ~stack.top();
+            ++pc;
+            break;
+
+        // ── KECCAK256 ────────────────────────────────────────────────
+        case OP_KECCAK256:
+        {
+            auto offset = static_cast<size_t>(stack.pop());
+            auto size = static_cast<size_t>(stack.pop());
+            if (size > 0)
+            {
+                memory.expand(offset + size);
+                auto hash = simple_keccak256(memory.ptr(offset), size);
+                stack.push(hash);
+            }
+            else
+            {
+                stack.push(0);
+            }
+            ++pc;
+            break;
+        }
+
+        // ── 环境指令 ─────────────────────────────────────────────────
+        case OP_ADDRESS:
+            stack.push(state.address);
+            ++pc;
+            break;
+
+        case OP_CALLER:
+            stack.push(state.msg.sender);
+            ++pc;
+            break;
+
+        case OP_CALLVALUE:
+            stack.push(state.msg.value);
+            ++pc;
+            break;
+
+        case OP_CALLDATALOAD:
+        {
+            auto offset = static_cast<size_t>(stack.top());
+            u64 v = 0;
+            for (size_t i = 0; i < 8 && offset + i < state.msg.input.size(); ++i)
+                v = (v << 8) | state.msg.input[offset + i];
+            stack.top() = v;
+            ++pc;
+            break;
+        }
+
+        case OP_CALLDATASIZE:
+            stack.push(state.msg.input.size());
+            ++pc;
+            break;
+
+        case OP_CALLDATACOPY:
+        {
+            auto mem_offset = static_cast<size_t>(stack.pop());
+            auto data_offset = static_cast<size_t>(stack.pop());
+            auto size = static_cast<size_t>(stack.pop());
+            if (size > 0)
+            {
+                memory.expand(mem_offset + size);
+                for (size_t i = 0; i < size; ++i)
+                {
+                    u8 byte = (data_offset + i < state.msg.input.size())
+                        ? state.msg.input[data_offset + i]
+                        : 0;
+                    memory.data[mem_offset + i] = byte;
+                }
+            }
+            ++pc;
+            break;
+        }
+
+        // ── 区块指令 ─────────────────────────────────────────────────
+        case OP_COINBASE:
+            stack.push(state.host->coinbase);
+            ++pc;
+            break;
+
+        case OP_TIMESTAMP:
+            stack.push(state.host->timestamp);
+            ++pc;
+            break;
+
+        case OP_NUMBER:
+            stack.push(state.host->block_number);
+            ++pc;
+            break;
+
+        // ── 栈操作 ───────────────────────────────────────────────────
+        case OP_POP:
+            stack.pop();
+            ++pc;
+            break;
+
+        // ── 内存操作 ─────────────────────────────────────────────────
+        case OP_MLOAD:
+        {
+            auto offset = static_cast<size_t>(stack.top());
+            memory.expand(offset + 32);
+            stack.top() = memory.load_u64(offset);
+            ++pc;
+            break;
+        }
+
+        case OP_MSTORE:
+        {
+            auto offset = static_cast<size_t>(stack.pop());
+            auto value = stack.pop();
+            memory.store_u64(offset, value);
+            ++pc;
+            break;
+        }
+
+        case OP_MSTORE8:
+        {
+            auto offset = static_cast<size_t>(stack.pop());
+            auto value = stack.pop();
+            memory.store8(offset, static_cast<u8>(value));
+            ++pc;
+            break;
+        }
+
+        // ── 存储操作 ─────────────────────────────────────────────────
+        case OP_SLOAD:
+        {
+            auto key = stack.top();
+            stack.top() = state.host->get_storage(key);
+            ++pc;
+            break;
+        }
+
+        case OP_SSTORE:
+        {
+            auto key = stack.pop();
+            auto value = stack.pop();
+            state.host->set_storage(key, value);
+            ++pc;
+            break;
+        }
+
+        // ── 控制流 ───────────────────────────────────────────────────
+        case OP_JUMP:
+        {
+            auto dst = static_cast<size_t>(stack.pop());
+            if (dst >= jumpdest.size() || !jumpdest[dst])
+            {
+                state.status = FAILURE;
+                return FAILURE;
+            }
+            pc = dst;
+            break;
+        }
+
+        case OP_JUMPI:
+        {
+            auto dst = static_cast<size_t>(stack.pop());
+            auto cond = stack.pop();
+            if (cond != 0)
+            {
+                if (dst >= jumpdest.size() || !jumpdest[dst])
+                {
+                    state.status = FAILURE;
+                    return FAILURE;
+                }
+                pc = dst;
+            }
+            else
+            {
+                ++pc;
+            }
+            break;
+        }
+
+        case OP_PC:
+            stack.push(pc);
+            ++pc;
+            break;
+
+        case OP_GAS:
+            stack.push(gas);
+            ++pc;
+            break;
+
+        case OP_JUMPDEST:
+            ++pc;
+            break;
+
+        // ── PUSH 指令 ────────────────────────────────────────────────
+        case OP_PUSH1:
+        case OP_PUSH2:
+        case OP_PUSH3:
+        case OP_PUSH4:
+        case OP_PUSH5:
+        case OP_PUSH6:
+        case OP_PUSH7:
+        case OP_PUSH8:
+        {
+            const int len = op - OP_PUSH1 + 1;
+            u64 v = 0;
+            for (int i = 0; i < len; ++i)
+                v = (v << 8) | code[pc + 1 + i];
+            stack.push(v);
+            pc += 1 + len;
+            break;
+        }
+
+        // ── DUP 指令 ─────────────────────────────────────────────────
+        case OP_DUP1:
+            stack.push(stack[0]);
+            ++pc;
+            break;
+        case OP_DUP2:
+            stack.push(stack[1]);
+            ++pc;
+            break;
+        case OP_DUP3:
+            stack.push(stack[2]);
+            ++pc;
+            break;
+        case OP_DUP4:
+            stack.push(stack[3]);
+            ++pc;
+            break;
+
+        // ── SWAP 指令 ────────────────────────────────────────────────
+        case OP_SWAP1:
+            std::swap(stack[0], stack[1]);
+            ++pc;
+            break;
+        case OP_SWAP2:
+            std::swap(stack[0], stack[2]);
+            ++pc;
+            break;
+        case OP_SWAP3:
+            std::swap(stack[0], stack[3]);
+            ++pc;
+            break;
+
+        // ── LOG ──────────────────────────────────────────────────────
+        case OP_LOG0:
+        {
+            stack.pop();  // offset (简化: 不使用)
+            auto size = static_cast<size_t>(stack.pop());
+            gas += GAS_LOG_DATA * ((size + 31) / 32);  // 补扣动态 gas
+            // 简化: 只计算 gas, 不实际存储 log
+            ++pc;
+            break;
+        }
+
+        // ── CALL ─────────────────────────────────────────────────────
+        case OP_CALL:
+        {
+            auto call_gas = stack.pop();
+            auto dst = stack.pop();
+            auto value = stack.pop();
+            auto in_off = static_cast<size_t>(stack.pop());
+            auto in_size = static_cast<size_t>(stack.pop());
+            stack.pop();  // out_off (简化: 不使用)
+            stack.pop();  // out_size (简化: 不使用)
+
+            stack.push(0);  // 假设失败
+
+            // depth 检查
+            if (static_cast<size_t>(state.msg.depth) >= CALL_DEPTH_LIMIT)
+            {
+                ++pc;
+                break;
+            }
+
+            // value > 0 时额外 gas
+            if (value > 0)
+            {
+                if (gas < GAS_CALL_VALUE)
+                {
+                    state.status = FAILURE;
+                    return FAILURE;
+                }
+                gas -= GAS_CALL_VALUE;
+            }
+
+            // 63/64 规则
+            u64 child_gas = std::min(call_gas, gas - gas / 64);
+            if (value > 0)
+                child_gas += GAS_CALL_STIPEND;
+
+            // 准备子调用
+            Message child_msg;
+            child_msg.sender = state.address;
+            child_msg.value = value;
+            child_msg.depth = state.msg.depth + 1;
+            if (in_size > 0)
+            {
+                memory.expand(in_off + in_size);
+                child_msg.input.assign(
+                    memory.ptr(in_off), memory.ptr(in_off) + in_size);
+            }
+
+            // 创建子状态
+            ExecutionState child_state;
+            child_state.host = state.host;
+            child_state.msg = child_msg;
+            child_state.gas = child_gas;
+            child_state.address = dst;
+
+            // 状态快照
+            auto checkpoint = state.host->checkpoint();
+
+            // 简化: 空代码直接成功
+            // 真实实现需要加载目标合约代码
+            auto result_gas = child_gas;  // 空代码不消耗 gas
+
+            // 回滚 (简化: 空代码无状态变更)
+            stack.top() = 1;  // 成功
+
+            // 结算 gas
+            u64 gas_used = child_gas - result_gas;
+            if (gas_used > gas)
+                gas = 0;
+            else
+                gas -= gas_used;
+
+            ++pc;
+            break;
+        }
+
+        // ── CREATE ───────────────────────────────────────────────────
+        case OP_CREATE:
+        {
+            stack.pop();  // value (简化: 不使用)
+            stack.pop();  // offset (简化: 不使用)
+            stack.pop();  // size (简化: 不使用)
+
+            stack.push(0);  // 简化: 总是失败
+            ++pc;
+            break;
+        }
+
+        // ── 终止指令 ─────────────────────────────────────────────────
+        case OP_RETURN:
+        {
+            auto offset = static_cast<size_t>(stack.pop());
+            auto size = static_cast<size_t>(stack.pop());
+            if (size > 0)
+            {
+                memory.expand(offset + size);
+                state.output.assign(memory.ptr(offset), memory.ptr(offset) + size);
+            }
+            state.status = SUCCESS;
+            return SUCCESS;
+        }
+
+        case OP_REVERT:
+        {
+            auto offset = static_cast<size_t>(stack.pop());
+            auto size = static_cast<size_t>(stack.pop());
+            if (size > 0)
+            {
+                memory.expand(offset + size);
+                state.output.assign(memory.ptr(offset), memory.ptr(offset) + size);
+            }
+            state.status = REVERT;
+            return REVERT;
+        }
+
+        case OP_STOP:
+            state.status = SUCCESS;
+            return SUCCESS;
+
+        default:
+            state.status = FAILURE;
+            return FAILURE;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  辅助函数
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 打印字节码
+void print_code(const u8* code, size_t size)
+{
+    for (size_t i = 0; i < size; ++i)
+        printf("%02x", code[i]);
+    printf("\n");
+}
+
+// 运行一个测试用例
+void run_test(const char* name, const u8* code, size_t code_size,
+    u64 gas_limit = 100000, u64 sender = 0xAAAA, u64 value = 0,
+    const bytes& input = {})
+{
+    printf("═══ %s ═══\n", name);
+    printf("Code: ");
+    print_code(code, code_size);
+
+    Host host;
+    auto analysis = analyze(code, code_size);
+
+    ExecutionState state;
+    state.host = &host;
+    state.gas = gas_limit;
+    state.address = 0xCCCC;
+    state.msg.sender = sender;
+    state.msg.value = value;
+    state.msg.input = input;
+
+    auto status = execute(state, analysis);
+
+    const char* status_str = (status == SUCCESS) ? "SUCCESS" :
+                             (status == REVERT) ? "REVERT" : "FAILURE";
+    printf("Status: %s\n", status_str);
+    printf("Gas used: %lu\n", gas_limit - state.gas);
+    printf("Gas left: %lu\n", state.gas);
+    printf("Stack size: %zu\n", state.stack.size);
+    if (state.stack.size > 0)
+        printf("Stack top: 0x%lx\n", state.stack.top());
+    if (!state.output.empty())
+    {
+        printf("Output: ");
+        for (auto b : state.output)
+            printf("%02x", b);
+        printf("\n");
+    }
+    printf("\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  测试用例
+// ═══════════════════════════════════════════════════════════════════════════
+
+int main()
+{
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║              mini_evm — 精简 EVM 实现                       ║\n");
+    printf("║              参考 evmone Baseline 解释器                    ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+
+    // ── 测试 1: 简单算术 ─────────────────────────────────────────────
+    // PUSH1 21 PUSH1 21 ADD STOP → 栈顶 = 42
+    {
+        u8 code[] = {0x60, 0x15, 0x60, 0x15, 0x01, 0x00};
+        run_test("Test 1: 21 + 21 = 42", code, sizeof(code));
+    }
+
+    // ── 测试 2: MSTORE + MLOAD ───────────────────────────────────────
+    // PUSH1 42 PUSH1 0 MSTORE PUSH1 0 MLOAD STOP → 栈顶 = 42
+    {
+        u8 code[] = {0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x00, 0x51, 0x00};
+        run_test("Test 2: MSTORE/MLOAD roundtrip", code, sizeof(code));
+    }
+
+    // ── 测试 3: JUMP + JUMPI ─────────────────────────────────────────
+    // PUSH1 1 PUSH1 0x0a JUMPI PUSH1 99 STOP JUMPDEST PUSH1 42 STOP
+    // → 栈顶 = 42 (跳过 99)
+    {
+        u8 code[] = {
+            0x60, 0x01,   // PUSH1 1 (condition)
+            0x60, 0x0a,   // PUSH1 0x0a (target)
+            0x57,         // JUMPI
+            0x60, 0x63,   // PUSH1 99 (dead code)
+            0x00,         // STOP
+            0x5b,         // JUMPDEST (PC=0x08) — 修正: 实际是 0x08
+            0x60, 0x2a,   // PUSH1 42
+            0x00          // STOP
+        };
+        // 修正 target
+        code[3] = 0x08;  // JUMPDEST 在 PC=0x08
+        run_test("Test 3: JUMPI conditional jump", code, sizeof(code));
+    }
+
+    // ── 测试 4: SSTORE + SLOAD ───────────────────────────────────────
+    // PUSH1 42 PUSH1 0 SSTORE PUSH1 0 SLOAD STOP → 栈顶 = 42
+    {
+        u8 code[] = {
+            0x60, 0x2a,   // PUSH1 42
+            0x60, 0x00,   // PUSH1 0 (slot)
+            0x55,         // SSTORE
+            0x60, 0x00,   // PUSH1 0 (slot)
+            0x54,         // SLOAD
+            0x00          // STOP
+        };
+        run_test("Test 4: SSTORE/SLOAD storage", code, sizeof(code));
+    }
+
+    // ── 测试 5: SUB ─────────────────────────────────────────────────
+    // PUSH1 7 PUSH1 3 SUB STOP → 栈顶 = 4 (7-3)
+    {
+        u8 code[] = {
+            0x60, 0x07,   // PUSH1 7
+            0x60, 0x03,   // PUSH1 3
+            0x03,         // SUB (7 - 3)
+            0x00          // STOP
+        };
+        run_test("Test 5: SUB (7 - 3 = 4)", code, sizeof(code));
+    }
+
+    // ── 测试 6: CALLER + CALLVALUE ───────────────────────────────────
+    // CALLER CALLVALUE ADD STOP → 栈顶 = sender + value
+    {
+        u8 code[] = {
+            0x33,         // CALLER
+            0x34,         // CALLVALUE
+            0x01,         // ADD
+            0x00          // STOP
+        };
+        run_test("Test 6: CALLER + CALLVALUE", code, sizeof(code),
+            100000, 0xAAAA, 100);
+    }
+
+    // ── 测试 7: CALLDATALOAD ─────────────────────────────────────────
+    // PUSH1 4 CALLDATALOAD STOP → 读取 calldata[4:12]
+    {
+        u8 code[] = {
+            0x60, 0x04,   // PUSH1 4
+            0x35,         // CALLDATALOAD
+            0x00          // STOP
+        };
+        bytes input = {0x00, 0x00, 0x00, 0x00,  // padding
+                       0x00, 0x00, 0x00, 0x2a};  // 42
+        run_test("Test 7: CALLDATALOAD reads calldata[4]", code, sizeof(code),
+            100000, 0xAAAA, 0, input);
+    }
+
+    // ── 测试 8: RETURN ───────────────────────────────────────────────
+    // PUSH1 42 PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+    {
+        u8 code[] = {
+            0x60, 0x2a,   // PUSH1 42
+            0x60, 0x00,   // PUSH1 0
+            0x52,         // MSTORE
+            0x60, 0x20,   // PUSH1 32
+            0x60, 0x00,   // PUSH1 0
+            0xf3          // RETURN
+        };
+        run_test("Test 8: RETURN with value 42", code, sizeof(code));
+    }
+
+    // ── 测试 9: 循环 (累加 1+2+...+10) ───────────────────────────────
+    // 计算 sum = 1+2+...+10 = 55
+    //
+    // 栈布局: [sum, i] (sum 在栈顶)
+    //
+    // 0x00: PUSH1 1       ; i = 1
+    // 0x02: PUSH1 0       ; sum = 0
+    // 0x04: JUMPDEST      ; loop_start (PC=0x04)
+    // 0x05: DUP2          ; [i, sum, i]
+    // 0x06: PUSH1 11      ; [11, i, sum, i]
+    // 0x08: SWAP1         ; [i, 11, sum, i] — 交换使 i 在栈顶
+    // 0x09: LT            ; [i<11, sum, i]
+    // 0x0a: ISZERO        ; [i>=11, sum, i] — 1=exit, 0=continue
+    // 0x0b: PUSH1 0x18    ; [exit, i>=11, sum, i]
+    // 0x0d: JUMPI         ; if i>=11, jump to exit
+    // 0x0e: DUP2          ; [i, sum, i]
+    // 0x0f: ADD           ; [sum+i, i] — sum += i
+    // 0x10: SWAP1         ; [i, sum+i]
+    // 0x11: PUSH1 1       ; [1, i, sum+i]
+    // 0x13: ADD           ; [i+1, sum+i] — i++
+    // 0x14: SWAP1         ; [sum+i, i+1]
+    // 0x15: PUSH1 0x04    ; [loop_start, sum+i, i+1]
+    // 0x17: JUMP          ; goto loop
+    // 0x18: JUMPDEST      ; exit (PC=0x18)
+    // 0x19: SWAP1         ; [i, sum]
+    // 0x1a: POP           ; [sum]
+    // 0x1b: STOP
+    {
+        u8 code[] = {
+            0x60, 0x01,   // 0x00: PUSH1 1 (i)
+            0x60, 0x00,   // 0x02: PUSH1 0 (sum)
+            0x5b,         // 0x04: JUMPDEST (loop start)
+            0x81,         // 0x05: DUP2 (dup i)
+            0x60, 0x0b,   // 0x06: PUSH1 11
+            0x90,         // 0x08: SWAP1 (i ↔ 11)
+            0x10,         // 0x09: LT (i < 11)
+            0x15,         // 0x0a: ISZERO (i >= 11)
+            0x60, 0x18,   // 0x0b: PUSH1 0x18 (exit)
+            0x57,         // 0x0d: JUMPI
+            0x81,         // 0x0e: DUP2 (dup i)
+            0x01,         // 0x0f: ADD (sum += i)
+            0x90,         // 0x10: SWAP1 (i ↔ sum)
+            0x60, 0x01,   // 0x11: PUSH1 1
+            0x01,         // 0x13: ADD (i++)
+            0x90,         // 0x14: SWAP1 (sum ↔ i)
+            0x60, 0x04,   // 0x15: PUSH1 0x04 (loop start)
+            0x56,         // 0x17: JUMP
+            0x5b,         // 0x18: JUMPDEST (exit)
+            0x90,         // 0x19: SWAP1 (sum ↔ i)
+            0x50,         // 0x1a: POP (pop i)
+            0x00          // 0x1b: STOP
+        };
+        run_test("Test 9: Loop sum(1..10) = 55", code, sizeof(code));
+    }
+
+    printf("═══ 所有测试完成 ═══\n");
+    return 0;
+}
