@@ -96,13 +96,18 @@ enum Opcode : u8 {
 //  Gas 成本表 — 参考 instructions_traits.hpp
 // ═══════════════════════════════════════════════════════════════════════════
 
-static constexpr int GAS_QUICK = 2;      // ADD, SUB, LT, GT, EQ, AND, OR, XOR, NOT
-static constexpr int GAS_MID = 3;        // MUL, DIV, MOD, PUSH, DUP, SWAP, POP
-static constexpr int GAS_SHA3 = 30;      // KECCAK256 base
-static constexpr int GAS_SHA3_WORD = 6;  // KECCAK256 per word
-static constexpr int GAS_MEMORY = 3;     // MLOAD, MSTORE
-static constexpr int GAS_SLOAD = 200;    // SLOAD (Simplified)
-static constexpr int GAS_SSTORE = 5000;  // SSTORE (Simplified, 不区分状态)
+// Gas 成本 — 参考 Frontier 修订版 (evmone gas_costs[EVMC_FRONTIER])
+static constexpr int GAS_ZERO = 0;      // STOP, RETURN, REVERT, PC, GAS, ADDRESS, CALLER...
+static constexpr int GAS_BASE = 2;      // ADD, SUB, LT, GT, EQ, ISZERO, AND, OR, XOR, NOT, POP
+static constexpr int GAS_VERYLOW = 3;   // MUL, DIV, MOD, ADDMOD, PUSH, DUP, SWAP
+static constexpr int GAS_LOW = 5;       // (未使用)
+static constexpr int GAS_MID = 8;       // JUMP
+static constexpr int GAS_HIGH = 10;     // JUMPI
+static constexpr int GAS_SHA3 = 30;     // KECCAK256 base
+static constexpr int GAS_SHA3_WORD = 6; // KECCAK256 per word
+static constexpr int GAS_MEMORY = 3;    // MLOAD, MSTORE, MSTORE8
+static constexpr int GAS_SLOAD = 200;   // SLOAD (Tangerine Whistle)
+static constexpr int GAS_SSTORE = 5000; // SSTORE (Simplified)
 static constexpr int GAS_JUMPDEST = 1;
 static constexpr int GAS_CALL = 700;
 static constexpr int GAS_CALL_VALUE = 9000;
@@ -110,64 +115,108 @@ static constexpr int GAS_CREATE = 32000;
 static constexpr int GAS_LOG0 = 375;
 static constexpr int GAS_LOG_DATA = 8;
 static constexpr int GAS_CALL_STIPEND = 2300;
-static constexpr int GAS_ZERO = 0;  // STOP, REVERT, RETURN, ADDRESS, CALLER...
+static constexpr int GAS_MEMORY_EXPANSION = 3;  // 每个新 word 的线性成本
 
-// 简化的 gas 成本表 (256 个槽位, -1 = 未定义)
-static consteval std::array<int, 256> make_gas_table()
+// ═══════════════════════════════════════════════════════════════════════════
+//  指令特征表 — 参考 instructions_traits.hpp
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct InstrTraits {
+    int gas_cost;             // 基础 gas 成本 (-1 = 未定义)
+    int stack_required;       // 栈中需要的最小元素数
+    int stack_change;         // 执行后栈高度变化 (+1, -1, -2 等)
+};
+
+static consteval std::array<InstrTraits, 256> make_traits()
 {
-    std::array<int, 256> t{};
-    t.fill(-1);
-    t[OP_STOP] = GAS_ZERO;
-    t[OP_ADD] = GAS_QUICK;
-    t[OP_MUL] = GAS_MID;
-    t[OP_SUB] = GAS_QUICK;
-    t[OP_DIV] = GAS_MID;
-    t[OP_MOD] = GAS_MID;
-    t[OP_ADDMOD] = GAS_MID;
-    t[OP_LT] = GAS_QUICK;
-    t[OP_GT] = GAS_QUICK;
-    t[OP_EQ] = GAS_QUICK;
-    t[OP_ISZERO] = GAS_QUICK;
-    t[OP_AND] = GAS_QUICK;
-    t[OP_OR] = GAS_QUICK;
-    t[OP_XOR] = GAS_QUICK;
-    t[OP_NOT] = GAS_QUICK;
-    t[OP_KECCAK256] = GAS_SHA3;
-    t[OP_ADDRESS] = GAS_ZERO;
-    t[OP_CALLER] = GAS_ZERO;
-    t[OP_CALLVALUE] = GAS_ZERO;
-    t[OP_CALLDATALOAD] = GAS_QUICK;
-    t[OP_CALLDATASIZE] = GAS_QUICK;
-    t[OP_CALLDATACOPY] = GAS_QUICK;
-    t[OP_COINBASE] = GAS_ZERO;
-    t[OP_TIMESTAMP] = GAS_ZERO;
-    t[OP_NUMBER] = GAS_ZERO;
-    t[OP_POP] = GAS_QUICK;
-    t[OP_MLOAD] = GAS_MEMORY;
-    t[OP_MSTORE] = GAS_MEMORY;
-    t[OP_MSTORE8] = GAS_MEMORY;
-    t[OP_SLOAD] = GAS_SLOAD;
-    t[OP_SSTORE] = GAS_SSTORE;
-    t[OP_JUMP] = GAS_MID;
-    t[OP_JUMPI] = GAS_MID;
-    t[OP_PC] = GAS_ZERO;
-    t[OP_GAS] = GAS_ZERO;
-    t[OP_JUMPDEST] = GAS_JUMPDEST;
+    std::array<InstrTraits, 256> t{};
+    t.fill({-1, 0, 0});  // 默认: 未定义
+
+    // 算术
+    t[OP_STOP]    = {GAS_ZERO, 0, 0};
+    t[OP_ADD]     = {GAS_BASE, 2, -1};
+    t[OP_MUL]     = {GAS_VERYLOW, 2, -1};
+    t[OP_SUB]     = {GAS_BASE, 2, -1};
+    t[OP_DIV]     = {GAS_VERYLOW, 2, -1};
+    t[OP_MOD]     = {GAS_VERYLOW, 2, -1};
+    t[OP_ADDMOD]  = {GAS_VERYLOW, 3, -2};
+
+    // 比较
+    t[OP_LT]      = {GAS_BASE, 2, -1};
+    t[OP_GT]      = {GAS_BASE, 2, -1};
+    t[OP_EQ]      = {GAS_BASE, 2, -1};
+    t[OP_ISZERO]  = {GAS_BASE, 1, 0};
+
+    // 位运算
+    t[OP_AND]     = {GAS_BASE, 2, -1};
+    t[OP_OR]      = {GAS_BASE, 2, -1};
+    t[OP_XOR]     = {GAS_BASE, 2, -1};
+    t[OP_NOT]     = {GAS_BASE, 1, 0};
+
+    // KECCAK256
+    t[OP_KECCAK256] = {GAS_SHA3, 2, -1};
+
+    // 环境
+    t[OP_ADDRESS]      = {GAS_ZERO, 0, 1};
+    t[OP_CALLER]       = {GAS_ZERO, 0, 1};
+    t[OP_CALLVALUE]    = {GAS_ZERO, 0, 1};
+    t[OP_CALLDATALOAD] = {GAS_BASE, 1, 0};
+    t[OP_CALLDATASIZE] = {GAS_ZERO, 0, 1};
+    t[OP_CALLDATACOPY] = {GAS_BASE, 3, -3};
+
+    // 区块
+    t[OP_COINBASE]   = {GAS_ZERO, 0, 1};
+    t[OP_TIMESTAMP]  = {GAS_ZERO, 0, 1};
+    t[OP_NUMBER]     = {GAS_ZERO, 0, 1};
+
+    // 栈/内存/存储
+    t[OP_POP]      = {GAS_BASE, 1, -1};
+    t[OP_MLOAD]    = {GAS_MEMORY, 1, 0};
+    t[OP_MSTORE]   = {GAS_MEMORY, 2, -2};
+    t[OP_MSTORE8]  = {GAS_MEMORY, 2, -2};
+    t[OP_SLOAD]    = {GAS_SLOAD, 1, 0};
+    t[OP_SSTORE]   = {GAS_SSTORE, 2, -2};
+
+    // 控制流
+    t[OP_JUMP]     = {GAS_MID, 1, -1};
+    t[OP_JUMPI]    = {GAS_HIGH, 2, -2};
+    t[OP_PC]       = {GAS_ZERO, 0, 1};
+    t[OP_GAS]      = {GAS_ZERO, 0, 1};
+    t[OP_JUMPDEST] = {GAS_JUMPDEST, 0, 0};
+
+    // PUSH (1-8 字节立即数)
     for (int op = OP_PUSH1; op <= OP_PUSH8; ++op)
-        t[op] = GAS_MID;
+        t[op] = {GAS_VERYLOW, 0, 1};
+
+    // DUP1-4
     for (int op = OP_DUP1; op <= OP_DUP4; ++op)
-        t[op] = GAS_MID;
+        t[op] = {GAS_VERYLOW, op - OP_DUP1, 1};
+
+    // SWAP1-3
     for (int op = OP_SWAP1; op <= OP_SWAP3; ++op)
-        t[op] = GAS_MID;
-    t[OP_LOG0] = GAS_LOG0;
-    t[OP_CREATE] = GAS_CREATE;
-    t[OP_CALL] = GAS_CALL;
-    t[OP_RETURN] = GAS_ZERO;
-    t[OP_REVERT] = GAS_ZERO;
+        t[op] = {GAS_VERYLOW, op - OP_SWAP1 + 1, 0};
+
+    // LOG0
+    t[OP_LOG0]    = {GAS_LOG0, 2, -2};
+
+    // 系统
+    t[OP_CREATE]  = {GAS_CREATE, 3, -2};
+    t[OP_CALL]    = {GAS_CALL, 7, -6};
+    t[OP_RETURN]  = {GAS_ZERO, 2, -2};
+    t[OP_REVERT]  = {GAS_ZERO, 2, -2};
+
     return t;
 }
 
-static constexpr auto GAS_TABLE = make_gas_table();
+static constexpr auto TRAITS = make_traits();
+
+// 便捷访问
+static constexpr auto GAS_TABLE = []() noexcept {
+    std::array<int, 256> t{};
+    for (int i = 0; i < 256; ++i)
+        t[i] = TRAITS[i].gas_cost;
+    return t;
+}();
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Stack — 参考 StackSpace + StackTop
@@ -193,21 +242,32 @@ struct Memory {
 
     Memory() { data.resize(4096, 0); }  // 初始 4KB
 
-    // 扩展内存 (参考 Memory::grow)
-    bool expand(size_t new_size)
+    // 扩展内存并扣除 gas (参考 Memory::grow + grow_memory)
+    // 返回 false 表示 gas 不足
+    bool expand(size_t new_size, u64& gas)
     {
         if (new_size <= active_size)
             return true;
         // 对齐到 32 字节
         new_size = (new_size + 31) & ~size_t{31};
+
+        // 计算内存扩展 gas: 3*words + words²/512 (增量)
+        size_t old_words = active_size / 32;
+        size_t new_words = new_size / 32;
+        u64 old_cost = 3 * old_words + old_words * old_words / 512;
+        u64 new_cost = 3 * new_words + new_words * new_words / 512;
+        u64 cost = new_cost - old_cost;
+
+        if (gas < cost)
+            return false;
+        gas -= cost;
+
         if (new_size > data.size())
             data.resize(new_size * 2, 0);  // 倍增
         active_size = new_size;
         return true;
     }
 
-    // 计算内存扩展 gas (参考 grow_memory)
-    // 简化版: 只返回需要的 words 数
     size_t words() const { return (active_size + 31) / 32; }
 
     u64 load_u64(size_t offset)
@@ -221,9 +281,10 @@ struct Memory {
         return v;
     }
 
-    void store_u64(size_t offset, u64 v)
+    bool store_u64(size_t offset, u64 v, u64& gas)
     {
-        expand(offset + 32);
+        if (!expand(offset + 32, gas))
+            return false;
         // 清零整个 32 字节
         std::fill_n(data.data() + offset, 32, 0);
         // 将值存储到最后 8 字节 (big-endian 256-bit)
@@ -232,19 +293,15 @@ struct Memory {
             data[offset + 24 + i] = static_cast<u8>(v);
             v >>= 8;
         }
+        return true;
     }
 
-    void store8(size_t offset, u8 v)
+    bool store8(size_t offset, u8 v, u64& gas)
     {
-        expand(offset + 1);
+        if (!expand(offset + 1, gas))
+            return false;
         data[offset] = v;
-    }
-
-    // 读取 calldata 到 memory
-    void store_bytes(size_t offset, const u8* src, size_t len)
-    {
-        expand(offset + len);
-        std::memcpy(data.data() + offset, src, len);
+        return true;
     }
 
     const u8* ptr(size_t offset) const { return data.data() + offset; }
@@ -255,26 +312,58 @@ struct Memory {
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct Host {
-    std::unordered_map<u64, u64> storage;
-    u64 balance = 1000000;  // 默认余额
+    // 每个地址的账户: code + storage + balance
+    struct Account {
+        bytes code;
+        std::unordered_map<u64, u64> storage;
+        u64 balance = 0;
+    };
+
+    std::unordered_map<u64, Account> accounts;
+    u64 default_balance = 1000000;
 
     // 区块信息 (简化)
     u64 coinbase = 0x1234;
     u64 timestamp = 1700000000;
     u64 block_number = 19000000;
 
-    u64 get_storage(u64 key) const
+    Account& get_account(u64 addr)
     {
-        auto it = storage.find(key);
-        return it != storage.end() ? it->second : 0;
+        auto it = accounts.find(addr);
+        if (it == accounts.end())
+        {
+            accounts[addr] = Account{{}, {}, default_balance};
+            return accounts[addr];
+        }
+        return it->second;
     }
 
-    void set_storage(u64 key, u64 value) { storage[key] = value; }
+    u64 get_storage(u64 addr, u64 key) const
+    {
+        auto it = accounts.find(addr);
+        if (it == accounts.end())
+            return 0;
+        auto sit = it->second.storage.find(key);
+        return sit != it->second.storage.end() ? sit->second : 0;
+    }
 
-    // 创建检查点用于回滚 (简化: 保存整个 storage)
-    using Checkpoint = std::unordered_map<u64, u64>;
-    Checkpoint checkpoint() const { return storage; }
-    void rollback(const Checkpoint& cp) { storage = cp; }
+    void set_storage(u64 addr, u64 key, u64 value)
+    {
+        get_account(addr).storage[key] = value;
+    }
+
+    const bytes* get_code(u64 addr) const
+    {
+        auto it = accounts.find(addr);
+        if (it == accounts.end() || it->second.code.empty())
+            return nullptr;
+        return &it->second.code;
+    }
+
+    // 创建检查点用于回滚 (简化: 深拷贝)
+    using Checkpoint = std::unordered_map<u64, Account>;
+    Checkpoint checkpoint() const { return accounts; }
+    void rollback(const Checkpoint& cp) { accounts = cp; }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -303,6 +392,7 @@ struct ExecutionState {
     size_t pc = 0;
     Status status = SUCCESS;
     bytes output;
+    bytes return_data;  // 上一次调用的返回数据
     u64 gas_refund = 0;
 
     // 合约地址 (简化)
@@ -332,12 +422,13 @@ CodeAnalysis analyze(const u8* raw_code, size_t raw_size)
     result.code[raw_size] = 0x00;  // STOP 终止保证
 
     // JUMPDEST 扫描 — 参考 analyze_jumpdests()
+    // 利用 OP_PUSH32 == 0x7f == INT8_MAX 的特性
     result.jumpdest.resize(raw_size, false);
     for (size_t i = 0; i < raw_size; ++i)
     {
         const auto op = result.code[i];
-        if (op >= OP_PUSH1 && op <= OP_PUSH8)
-            i += op - OP_PUSH1 + 1;  // 跳过立即数
+        if (static_cast<int8_t>(op) >= static_cast<int8_t>(OP_PUSH1))
+            i += op - OP_PUSH1 + 1;  // 跳过 PUSH1-PUSH32 的立即数
         else if (op == OP_JUMPDEST)
             result.jumpdest[i] = true;
     }
@@ -381,20 +472,49 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
         const auto op = code[pc];
 
         // ═══════════════════════════════════════════════════════════════
-        //  Gas 检查 — 参考 check_requirements<Op>()
+        //  check_requirements — 参考 baseline_execution.cpp
+        //  ① 未定义指令检查
+        //  ② 栈溢出/下溢检查
+        //  ③ Gas 检查
         // ═══════════════════════════════════════════════════════════════
-        const int gas_cost = GAS_TABLE[op];
-        if (gas_cost < 0)
+        const auto& traits = TRAITS[op];
+        if (traits.gas_cost < 0)
         {
             state.status = FAILURE;
+            gas = 0;  // EVM 规范: FAILURE 时 gas 归零
             return FAILURE;
         }
-        if (gas < static_cast<u64>(gas_cost))
+
+        // 栈溢出检查 (对于产生值的指令)
+        if (traits.stack_change > 0)
+        {
+            if (stack.size >= STACK_LIMIT)
+            {
+                state.status = FAILURE;
+                gas = 0;
+                return FAILURE;
+            }
+        }
+
+        // 栈下溢检查 (对于消费值的指令)
+        if (traits.stack_required > 0)
+        {
+            if (stack.size < static_cast<size_t>(traits.stack_required))
+            {
+                state.status = FAILURE;
+                gas = 0;
+                return FAILURE;
+            }
+        }
+
+        // Gas 检查
+        if (gas < static_cast<u64>(traits.gas_cost))
         {
             state.status = FAILURE;
+            gas = 0;
             return FAILURE;
         }
-        gas -= gas_cost;
+        gas -= traits.gas_cost;
 
         // ═══════════════════════════════════════════════════════════════
         //  指令分发 — 参考 MAP_OPCODES switch 展开
@@ -496,9 +616,16 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
         {
             auto offset = static_cast<size_t>(stack.pop());
             auto size = static_cast<size_t>(stack.pop());
+            // 动态 gas: 6 per word
+            gas += traits.gas_cost;  // 退基础 gas
+            u64 dyn_gas = GAS_SHA3 + GAS_SHA3_WORD * ((size + 31) / 32);
+            if (gas < dyn_gas) { state.status = FAILURE; gas = 0; return FAILURE; }
+            gas -= dyn_gas;
+
             if (size > 0)
             {
-                memory.expand(offset + size);
+                if (!memory.expand(offset + size, gas))
+                    { state.status = FAILURE; gas = 0; return FAILURE; }
                 auto hash = simple_keccak256(memory.ptr(offset), size);
                 stack.push(hash);
             }
@@ -549,7 +676,8 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
             auto size = static_cast<size_t>(stack.pop());
             if (size > 0)
             {
-                memory.expand(mem_offset + size);
+                if (!memory.expand(mem_offset + size, gas))
+                    { state.status = FAILURE; gas = 0; return FAILURE; }
                 for (size_t i = 0; i < size; ++i)
                 {
                     u8 byte = (data_offset + i < state.msg.input.size())
@@ -588,7 +716,8 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
         case OP_MLOAD:
         {
             auto offset = static_cast<size_t>(stack.top());
-            memory.expand(offset + 32);
+            if (!memory.expand(offset + 32, gas))
+                { state.status = FAILURE; gas = 0; return FAILURE; }
             stack.top() = memory.load_u64(offset);
             ++pc;
             break;
@@ -598,7 +727,8 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
         {
             auto offset = static_cast<size_t>(stack.pop());
             auto value = stack.pop();
-            memory.store_u64(offset, value);
+            if (!memory.store_u64(offset, value, gas))
+                { state.status = FAILURE; gas = 0; return FAILURE; }
             ++pc;
             break;
         }
@@ -607,7 +737,8 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
         {
             auto offset = static_cast<size_t>(stack.pop());
             auto value = stack.pop();
-            memory.store8(offset, static_cast<u8>(value));
+            if (!memory.store8(offset, static_cast<u8>(value), gas))
+                { state.status = FAILURE; gas = 0; return FAILURE; }
             ++pc;
             break;
         }
@@ -616,7 +747,7 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
         case OP_SLOAD:
         {
             auto key = stack.top();
-            stack.top() = state.host->get_storage(key);
+            stack.top() = state.host->get_storage(state.address, key);
             ++pc;
             break;
         }
@@ -625,7 +756,7 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
         {
             auto key = stack.pop();
             auto value = stack.pop();
-            state.host->set_storage(key, value);
+            state.host->set_storage(state.address, key, value);
             ++pc;
             break;
         }
@@ -637,6 +768,7 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
             if (dst >= jumpdest.size() || !jumpdest[dst])
             {
                 state.status = FAILURE;
+                gas = 0;
                 return FAILURE;
             }
             pc = dst;
@@ -652,6 +784,7 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
                 if (dst >= jumpdest.size() || !jumpdest[dst])
                 {
                     state.status = FAILURE;
+                    gas = 0;
                     return FAILURE;
                 }
                 pc = dst;
@@ -731,15 +864,19 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
         // ── LOG ──────────────────────────────────────────────────────
         case OP_LOG0:
         {
-            stack.pop();  // offset (简化: 不使用)
+            stack.pop();  // offset
             auto size = static_cast<size_t>(stack.pop());
-            gas += GAS_LOG_DATA * ((size + 31) / 32);  // 补扣动态 gas
+            // 动态 gas: 8 per byte
+            gas += traits.gas_cost;  // 退基础 gas
+            u64 dyn_gas = GAS_LOG0 + GAS_LOG_DATA * size;
+            if (gas < dyn_gas) { state.status = FAILURE; gas = 0; return FAILURE; }
+            gas -= dyn_gas;
             // 简化: 只计算 gas, 不实际存储 log
             ++pc;
             break;
         }
 
-        // ── CALL ─────────────────────────────────────────────────────
+        // ── CALL — 参考 instructions_calls.cpp call_impl ─────────────
         case OP_CALL:
         {
             auto call_gas = stack.pop();
@@ -747,12 +884,13 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
             auto value = stack.pop();
             auto in_off = static_cast<size_t>(stack.pop());
             auto in_size = static_cast<size_t>(stack.pop());
-            stack.pop();  // out_off (简化: 不使用)
-            stack.pop();  // out_size (简化: 不使用)
+            auto out_off = static_cast<size_t>(stack.pop());
+            auto out_size = static_cast<size_t>(stack.pop());
 
             stack.push(0);  // 假设失败
+            state.return_data.clear();
 
-            // depth 检查
+            // depth 检查 — "轻失败"
             if (static_cast<size_t>(state.msg.depth) >= CALL_DEPTH_LIMIT)
             {
                 ++pc;
@@ -763,17 +901,21 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
             if (value > 0)
             {
                 if (gas < GAS_CALL_VALUE)
-                {
-                    state.status = FAILURE;
-                    return FAILURE;
-                }
+                    { state.status = FAILURE; gas = 0; return FAILURE; }
                 gas -= GAS_CALL_VALUE;
             }
 
-            // 63/64 规则
-            u64 child_gas = std::min(call_gas, gas - gas / 64);
+            // 63/64 规则 — 参考 EIP-150
+            u64 max_child_gas = gas - gas / 64;
+            u64 child_gas = std::min(call_gas, max_child_gas);
             if (value > 0)
                 child_gas += GAS_CALL_STIPEND;
+
+            // 内存检查
+            if (in_size > 0 && !memory.expand(in_off + in_size, gas))
+                { state.status = FAILURE; gas = 0; return FAILURE; }
+            if (out_size > 0 && !memory.expand(out_off + out_size, gas))
+                { state.status = FAILURE; gas = 0; return FAILURE; }
 
             // 准备子调用
             Message child_msg;
@@ -781,35 +923,60 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
             child_msg.value = value;
             child_msg.depth = state.msg.depth + 1;
             if (in_size > 0)
-            {
-                memory.expand(in_off + in_size);
-                child_msg.input.assign(
-                    memory.ptr(in_off), memory.ptr(in_off) + in_size);
-            }
-
-            // 创建子状态
-            ExecutionState child_state;
-            child_state.host = state.host;
-            child_state.msg = child_msg;
-            child_state.gas = child_gas;
-            child_state.address = dst;
+                child_msg.input.assign(memory.ptr(in_off), memory.ptr(in_off) + in_size);
 
             // 状态快照
             auto checkpoint = state.host->checkpoint();
 
-            // 简化: 空代码直接成功
-            // 真实实现需要加载目标合约代码
-            auto result_gas = child_gas;  // 空代码不消耗 gas
+            // 执行子调用
+            const auto* child_code = state.host->get_code(dst);
+            u64 result_gas_left = child_gas;
+            Status result_status = SUCCESS;
+            u64 child_refund = 0;
 
-            // 回滚 (简化: 空代码无状态变更)
-            stack.top() = 1;  // 成功
+            if (child_code == nullptr)
+            {
+                // 空代码: 直接成功
+                result_gas_left = child_gas;
+                result_status = SUCCESS;
+            }
+            else
+            {
+                // 加载子合约代码并执行
+                auto child_analysis = analyze(child_code->data(), child_code->size());
+                ExecutionState child_state;
+                child_state.host = state.host;
+                child_state.msg = child_msg;
+                child_state.gas = child_gas;
+                child_state.address = dst;
+
+                result_status = execute(child_state, child_analysis);
+                result_gas_left = child_state.gas;
+                child_refund = child_state.gas_refund;
+                state.return_data = child_state.output;
+            }
+
+            // 失败时回滚
+            if (result_status != SUCCESS)
+                state.host->rollback(checkpoint);
+
+            // 更新栈顶
+            stack.top() = (result_status == SUCCESS) ? 1 : 0;
+
+            // 拷贝输出到父 memory
+            u64 copy_size = std::min(out_size, state.return_data.size());
+            if (copy_size > 0)
+                std::memcpy(memory.data.data() + out_off, state.return_data.data(), copy_size);
 
             // 结算 gas
-            u64 gas_used = child_gas - result_gas;
+            u64 gas_used = child_gas - result_gas_left;
             if (gas_used > gas)
                 gas = 0;
             else
                 gas -= gas_used;
+
+            // 退款传播
+            state.gas_refund += child_refund;
 
             ++pc;
             break;
@@ -834,7 +1001,8 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
             auto size = static_cast<size_t>(stack.pop());
             if (size > 0)
             {
-                memory.expand(offset + size);
+                if (!memory.expand(offset + size, gas))
+                    { state.status = FAILURE; gas = 0; return FAILURE; }
                 state.output.assign(memory.ptr(offset), memory.ptr(offset) + size);
             }
             state.status = SUCCESS;
@@ -847,7 +1015,8 @@ Status execute(ExecutionState& state, const CodeAnalysis& analysis)
             auto size = static_cast<size_t>(stack.pop());
             if (size > 0)
             {
-                memory.expand(offset + size);
+                if (!memory.expand(offset + size, gas))
+                    { state.status = FAILURE; gas = 0; return FAILURE; }
                 state.output.assign(memory.ptr(offset), memory.ptr(offset) + size);
             }
             state.status = REVERT;
@@ -888,6 +1057,10 @@ void run_test(const char* name, const u8* code, size_t code_size,
 
     Host host;
     auto analysis = analyze(code, code_size);
+
+    // 注册合约代码到 Host
+    auto& acc = host.get_account(0xCCCC);
+    acc.code.assign(code, code + code_size);
 
     ExecutionState state;
     state.host = &host;
